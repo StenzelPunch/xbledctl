@@ -26,18 +26,31 @@ void xbox_init(XboxController *ctrl)
     ctrl->seq = 1;
 }
 
-static bool discover_device(XboxController *ctrl)
+static bool has_device_id(const uint64_t *device_ids, int count, uint64_t device_id)
 {
-    HANDLE h = (HANDLE)ctrl->handle;
+    for (int i = 0; i < count; i++) {
+        if (device_ids[i] == device_id)
+            return true;
+    }
+    return false;
+}
+
+static int discover_devices(HANDLE h, HANDLE read_event, uint64_t *device_ids, int max_devices)
+{
+    if (!device_ids || max_devices <= 0)
+        return 0;
+
     DWORD bytes = 0;
     DeviceIoControl(h, GIP_REENUMERATE, NULL, 0, NULL, 0, &bytes, NULL);
 
     uint8_t buf[4096];
     OVERLAPPED ov;
     memset(&ov, 0, sizeof(ov));
-    ov.hEvent = (HANDLE)ctrl->read_event;
+    ov.hEvent = read_event;
 
-    for (int i = 0; i < 5; i++) {
+    int found = 0;
+
+    for (int i = 0; i < 16; i++) {
         memset(buf, 0, sizeof(buf));
         ResetEvent(ov.hEvent);
         DWORD rd = 0;
@@ -56,14 +69,58 @@ static bool discover_device(XboxController *ctrl)
 
         GipHeader *hdr = (GipHeader *)buf;
         if (hdr->commandId == 0x01 || hdr->commandId == 0x02) {
-            ctrl->device_id = hdr->deviceId;
-            return true;
+            if (!has_device_id(device_ids, found, hdr->deviceId)) {
+                if (found < max_devices) {
+                    device_ids[found++] = hdr->deviceId;
+                } else {
+                    break;
+                }
+            }
         }
     }
-    return false;
+
+    return found;
+}
+
+bool xbox_enumerate_devices(uint64_t *device_ids, int max_devices, int *out_count)
+{
+    if (out_count)
+        *out_count = 0;
+    if (!device_ids || max_devices <= 0)
+        return false;
+
+    HANDLE h = CreateFileW(L"\\\\.\\XboxGIP",
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        NULL);
+
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    HANDLE read_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!read_event) {
+        CloseHandle(h);
+        return false;
+    }
+
+    int found = discover_devices(h, read_event, device_ids, max_devices);
+
+    CloseHandle(read_event);
+    CloseHandle(h);
+
+    if (out_count)
+        *out_count = found;
+    return found > 0;
 }
 
 bool xbox_open(XboxController *ctrl)
+{
+    return xbox_open_device(ctrl, 0);
+}
+
+bool xbox_open_device(XboxController *ctrl, uint64_t device_id)
 {
     xbox_close(ctrl);
 
@@ -83,13 +140,35 @@ bool xbox_open(XboxController *ctrl)
     ctrl->handle = h;
     ctrl->read_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    if (!discover_device(ctrl)) {
+    if (!ctrl->read_event) {
+        snprintf(ctrl->error, sizeof(ctrl->error), "Cannot create read event");
+        ctrl->last_err = XBOX_ERR_OPEN_FAILED;
+        xbox_close(ctrl);
+        return false;
+    }
+
+    uint64_t ids[16];
+    int count = discover_devices((HANDLE)ctrl->handle, (HANDLE)ctrl->read_event, ids, 16);
+
+    if (count <= 0) {
         snprintf(ctrl->error, sizeof(ctrl->error), "No Xbox controller found");
         ctrl->last_err = XBOX_ERR_NO_DEVICE;
         xbox_close(ctrl);
         return false;
     }
 
+    uint64_t target_id = device_id;
+    if (target_id == 0)
+        target_id = ids[0];
+
+    if (!has_device_id(ids, count, target_id)) {
+        snprintf(ctrl->error, sizeof(ctrl->error), "Selected controller not found");
+        ctrl->last_err = XBOX_ERR_NO_DEVICE;
+        xbox_close(ctrl);
+        return false;
+    }
+
+    ctrl->device_id = target_id;
     ctrl->connected = true;
     ctrl->last_err = XBOX_OK;
     ctrl->error[0] = '\0';

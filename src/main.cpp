@@ -30,6 +30,74 @@ static void CleanupRenderTarget();
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 static char g_config_path[MAX_PATH] = {};
+static const int MAX_CONTROLLERS = 8;
+static const int MAX_PROFILES = 32;
+
+struct ControllerProfile {
+    uint64_t device_id;
+    int brightness;
+    int mode_idx;
+};
+
+static ControllerProfile g_profiles[MAX_PROFILES] = {};
+static int g_profile_count = 0;
+static uint64_t g_config_selected_device_id = 0;
+static int g_default_brightness = LED_BRIGHTNESS_DEFAULT;
+static int g_default_mode_idx = 1;
+
+static int ClampBrightness(int value)
+{
+    if (value < LED_BRIGHTNESS_MIN) return LED_BRIGHTNESS_MIN;
+    if (value > LED_BRIGHTNESS_MAX) return LED_BRIGHTNESS_MAX;
+    return value;
+}
+
+static int ClampModeIdx(int value)
+{
+    if (value < 0 || value > 7) return 1;
+    return value;
+}
+
+static int FindProfileIndex(uint64_t device_id)
+{
+    for (int i = 0; i < g_profile_count; i++) {
+        if (g_profiles[i].device_id == device_id)
+            return i;
+    }
+    return -1;
+}
+
+static void SetProfileValue(uint64_t device_id, int brightness, int mode_idx)
+{
+    if (device_id == 0)
+        return;
+
+    int idx = FindProfileIndex(device_id);
+    if (idx < 0) {
+        if (g_profile_count < MAX_PROFILES) {
+            idx = g_profile_count++;
+        } else {
+            idx = MAX_PROFILES - 1;
+        }
+        g_profiles[idx].device_id = device_id;
+    }
+
+    g_profiles[idx].brightness = ClampBrightness(brightness);
+    g_profiles[idx].mode_idx = ClampModeIdx(mode_idx);
+}
+
+static bool GetProfileValue(uint64_t device_id, int *brightness, int *mode_idx)
+{
+    int idx = FindProfileIndex(device_id);
+    if (idx < 0)
+        return false;
+
+    if (brightness)
+        *brightness = g_profiles[idx].brightness;
+    if (mode_idx)
+        *mode_idx = g_profiles[idx].mode_idx;
+    return true;
+}
 
 static void InitConfigPath()
 {
@@ -38,23 +106,39 @@ static void InitConfigPath()
     strcat_s(g_config_path, "\\xbledctl.ini");
 }
 
-static void SaveConfig(int brightness, int mode_idx, bool start_with_windows, bool minimize_to_tray)
+static void SaveConfig(int brightness, int mode_idx, bool start_with_windows, bool minimize_to_tray, uint64_t selected_device_id)
 {
-    char buf[512];
-    snprintf(buf, sizeof(buf),
-        "[xbledctl]\nbrightness=%d\nmode=%d\nstart_with_windows=%d\nminimize_to_tray=%d\n",
-        brightness, mode_idx, start_with_windows ? 1 : 0, minimize_to_tray ? 1 : 0);
     FILE *f = nullptr;
     fopen_s(&f, g_config_path, "w");
-    if (f) { fputs(buf, f); fclose(f); }
+    if (!f)
+        return;
+
+    fprintf(f, "[xbledctl]\n");
+    fprintf(f, "brightness=%d\n", ClampBrightness(brightness));
+    fprintf(f, "mode=%d\n", ClampModeIdx(mode_idx));
+    fprintf(f, "start_with_windows=%d\n", start_with_windows ? 1 : 0);
+    fprintf(f, "minimize_to_tray=%d\n", minimize_to_tray ? 1 : 0);
+    fprintf(f, "selected_controller_id=%016llX\n", (unsigned long long)selected_device_id);
+
+    for (int i = 0; i < g_profile_count; i++) {
+        fprintf(f, "profile=%016llX,%d,%d\n",
+                (unsigned long long)g_profiles[i].device_id,
+                ClampBrightness(g_profiles[i].brightness),
+                ClampModeIdx(g_profiles[i].mode_idx));
+    }
+
+    fclose(f);
 }
 
-static void LoadConfig(int *brightness, int *mode_idx, bool *start_with_windows, bool *minimize_to_tray)
+static void LoadConfig(int *brightness, int *mode_idx, bool *start_with_windows, bool *minimize_to_tray, uint64_t *selected_device_id)
 {
     *brightness = LED_BRIGHTNESS_DEFAULT;
     *mode_idx = 1;
     *start_with_windows = true;
     *minimize_to_tray = true;
+    if (selected_device_id)
+        *selected_device_id = 0;
+    g_profile_count = 0;
 
     FILE *f = nullptr;
     fopen_s(&f, g_config_path, "r");
@@ -63,14 +147,23 @@ static void LoadConfig(int *brightness, int *mode_idx, bool *start_with_windows,
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         int val;
+        unsigned long long id = 0;
+        int p_brightness = 0;
+        int p_mode_idx = 0;
         if (sscanf_s(line, "brightness=%d", &val) == 1)
-            *brightness = (val >= 0 && val <= LED_BRIGHTNESS_MAX) ? val : LED_BRIGHTNESS_DEFAULT;
+            *brightness = ClampBrightness(val);
         else if (sscanf_s(line, "mode=%d", &val) == 1)
-            *mode_idx = (val >= 0 && val <= 7) ? val : 1;
+            *mode_idx = ClampModeIdx(val);
         else if (sscanf_s(line, "start_with_windows=%d", &val) == 1)
             *start_with_windows = (val != 0);
         else if (sscanf_s(line, "minimize_to_tray=%d", &val) == 1)
             *minimize_to_tray = (val != 0);
+        else if (sscanf_s(line, "selected_controller_id=%llx", &id) == 1) {
+            if (selected_device_id)
+                *selected_device_id = (uint64_t)id;
+        } else if (sscanf_s(line, "profile=%llx,%d,%d", &id, &p_brightness, &p_mode_idx) == 3) {
+            SetProfileValue((uint64_t)id, p_brightness, p_mode_idx);
+        }
     }
     fclose(f);
 }
@@ -148,6 +241,10 @@ static void RestoreFromTray(HWND hwnd)
 }
 
 static XboxController g_ctrl;
+static uint64_t       g_device_ids[MAX_CONTROLLERS] = {};
+static int            g_device_count = 0;
+static int            g_selected_device_idx = 0;
+static uint64_t       g_selected_device_id = 0;
 static int            g_brightness = LED_BRIGHTNESS_DEFAULT;
 static int            g_mode_idx   = 1;
 static char           g_status[128] = "Plug in your controller with a USB cable";
@@ -159,13 +256,14 @@ static DWORD          g_device_change_tick = 0;
 static bool           g_device_removed = false;
 static bool           g_controller_present = false;
 
-enum WorkerCmd { CMD_NONE, CMD_REFRESH, CMD_APPLY };
+enum WorkerCmd { CMD_NONE, CMD_REFRESH, CMD_REFRESH_APPLY, CMD_APPLY };
 static HANDLE         g_worker_thread = nullptr;
 static HANDLE         g_worker_event = nullptr;
 static volatile WorkerCmd g_worker_cmd = CMD_NONE;
 static volatile bool  g_worker_busy = false;
 static volatile int   g_worker_brightness = 0;
 static volatile int   g_worker_mode = 0;
+static volatile unsigned long long g_worker_device_id = 0;
 
 static const ImVec4 COL_WARN    = ImVec4(0.902f, 0.706f, 0.157f, 1.0f);
 
@@ -194,6 +292,75 @@ static const ImVec4 COL_ACCENT   = ImVec4(0.063f, 0.486f, 0.063f, 1.0f);
 static const ImVec4 COL_ACCENT_H = ImVec4(0.078f, 0.627f, 0.078f, 1.0f);
 static const ImVec4 COL_ACCENT_A = ImVec4(0.047f, 0.392f, 0.047f, 1.0f);
 
+static int FindDeviceIndex(uint64_t device_id)
+{
+    for (int i = 0; i < g_device_count; i++) {
+        if (g_device_ids[i] == device_id)
+            return i;
+    }
+    return -1;
+}
+
+static void LoadSelectedProfile()
+{
+    int brightness = g_default_brightness;
+    int mode_idx = g_default_mode_idx;
+
+    if (g_selected_device_id != 0)
+        GetProfileValue(g_selected_device_id, &brightness, &mode_idx);
+
+    g_brightness = ClampBrightness(brightness);
+    g_mode_idx = ClampModeIdx(mode_idx);
+}
+
+static void SetDiscoveredDevices(const uint64_t *device_ids, int count)
+{
+    if (count < 0)
+        count = 0;
+    if (count > MAX_CONTROLLERS)
+        count = MAX_CONTROLLERS;
+
+    g_device_count = count;
+    for (int i = 0; i < count; i++)
+        g_device_ids[i] = device_ids[i];
+    for (int i = count; i < MAX_CONTROLLERS; i++)
+        g_device_ids[i] = 0;
+
+    if (count == 0) {
+        g_selected_device_idx = 0;
+        g_selected_device_id = 0;
+        g_controller_present = false;
+        return;
+    }
+
+    int idx = -1;
+    if (g_selected_device_id != 0)
+        idx = FindDeviceIndex(g_selected_device_id);
+    if (idx < 0 && g_config_selected_device_id != 0)
+        idx = FindDeviceIndex(g_config_selected_device_id);
+    if (idx < 0)
+        idx = 0;
+
+    g_selected_device_idx = idx;
+    g_selected_device_id = g_device_ids[idx];
+    g_config_selected_device_id = g_selected_device_id;
+    g_controller_present = true;
+    LoadSelectedProfile();
+}
+
+static bool RefreshControllerList()
+{
+    uint64_t ids[MAX_CONTROLLERS] = {};
+    int count = 0;
+    if (!xbox_enumerate_devices(ids, MAX_CONTROLLERS, &count) || count <= 0) {
+        SetDiscoveredDevices(ids, 0);
+        return false;
+    }
+
+    SetDiscoveredDevices(ids, count);
+    return true;
+}
+
 static void SetStatus(const char *msg, const ImVec4 &col)
 {
     snprintf(g_status, sizeof(g_status), "%s", msg);
@@ -206,8 +373,9 @@ static void PostWorkerCmd(WorkerCmd cmd)
     if (g_worker_busy)
         return;
     if (cmd == CMD_APPLY) {
-        g_worker_brightness = g_brightness;
-        g_worker_mode = g_mode_idx;
+        g_worker_brightness = ClampBrightness(g_brightness);
+        g_worker_mode = ClampModeIdx(g_mode_idx);
+        g_worker_device_id = (unsigned long long)g_selected_device_id;
     }
     g_worker_cmd = cmd;
     g_worker_busy = true;
@@ -220,30 +388,73 @@ static DWORD WINAPI WorkerThread(LPVOID /*unused*/)
         WorkerCmd cmd = g_worker_cmd;
         g_worker_cmd = CMD_NONE;
 
-        if (cmd == CMD_REFRESH) {
-            xbox_close(&g_ctrl);
-            if (xbox_open(&g_ctrl)) {
-                g_controller_present = true;
-                xbox_close(&g_ctrl);
+        if (cmd == CMD_REFRESH || cmd == CMD_REFRESH_APPLY) {
+            if (RefreshControllerList()) {
                 SetStatus("Ready - drag the slider or pick a mode", COL_SUCCESS);
+                if (cmd == CMD_REFRESH_APPLY) {
+                    int applied = 0;
+                    int failed = 0;
+
+                    for (int i = 0; i < g_device_count; i++) {
+                        uint64_t device_id = g_device_ids[i];
+                        int mode_idx = g_default_mode_idx;
+                        int bright = g_default_brightness;
+                        GetProfileValue(device_id, &bright, &mode_idx);
+
+                        mode_idx = ClampModeIdx(mode_idx);
+                        bright = ClampBrightness(bright);
+                        if (mode_idx == 0)
+                            bright = 0;
+
+                        if (!xbox_open_device(&g_ctrl, device_id)) {
+                            failed++;
+                            continue;
+                        }
+
+                        bool ok = xbox_set_led(&g_ctrl, (uint8_t)MODES[mode_idx].value, (uint8_t)bright);
+                        xbox_close(&g_ctrl);
+
+                        if (ok) {
+                            applied++;
+                        } else {
+                            failed++;
+                        }
+                    }
+
+                    if (applied > 0) {
+                        if (failed == 0)
+                            SetStatus("Controllers detected - settings applied", COL_SUCCESS);
+                        else
+                            SetStatus("Some controllers applied - try Refresh", COL_WARN);
+                    } else {
+                        SetStatus("Command failed - try Refresh to reconnect", COL_ERROR);
+                    }
+                }
             } else {
-                g_controller_present = false;
                 SetStatus("Plug in your controller with a USB cable", COL_DIM);
             }
         } else if (cmd == CMD_APPLY) {
-            int mode_idx = g_worker_mode;
+            int mode_idx = ClampModeIdx(g_worker_mode);
             int mode_val = MODES[mode_idx].value;
-            int bright = g_worker_brightness;
+            int bright = ClampBrightness(g_worker_brightness);
+            uint64_t device_id = (uint64_t)g_worker_device_id;
             if (mode_idx == 0) bright = 0;
 
-            if (!xbox_open(&g_ctrl)) {
-                g_controller_present = false;
-                SetStatus("Cannot open controller - try Refresh", COL_ERROR);
+            if (device_id == 0) {
+                SetStatus("No controller selected - click Refresh", COL_ERROR);
+            } else if (!xbox_open_device(&g_ctrl, device_id)) {
+                RefreshControllerList();
+                if (g_controller_present)
+                    SetStatus("Selected controller unavailable - choose another", COL_WARN);
+                else
+                    SetStatus("Cannot open controller - try Refresh", COL_ERROR);
             } else {
-                g_controller_present = true;
                 bool ok = xbox_set_led(&g_ctrl, (uint8_t)mode_val, (uint8_t)bright);
                 xbox_close(&g_ctrl);
                 if (ok) {
+                    SetProfileValue(device_id, bright, mode_idx);
+                    g_selected_device_id = device_id;
+                    g_config_selected_device_id = device_id;
                     if (bright == 0 || mode_idx == 0) {
                         SetStatus("LED turned off", COL_SUCCESS);
                     } else {
@@ -252,7 +463,7 @@ static DWORD WINAPI WorkerThread(LPVOID /*unused*/)
                                  MODES[mode_idx].label, bright, LED_BRIGHTNESS_MAX);
                         SetStatus(buf, COL_SUCCESS);
                     }
-                    SaveConfig(bright, mode_idx, g_start_with_windows, g_minimize_to_tray);
+                    SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray, g_selected_device_id);
                 } else {
                     SetStatus("Command failed - try Refresh to reconnect", COL_ERROR);
                 }
@@ -278,7 +489,7 @@ static void RefreshController()
 static void TryAutoApply()
 {
     SetStatus("Controller detected - applying settings...", COL_DIM);
-    PostWorkerCmd(CMD_APPLY);
+    PostWorkerCmd(CMD_REFRESH_APPLY);
 }
 
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -398,6 +609,44 @@ static void RenderGui(ImFont *fontTitle, ImFont *fontSub, ImFont *fontBig)
     ImGui::EndChild();
     ImGui::Spacing();
 
+    ImGui::BeginChild("##controller_select_card", ImVec2(-1, 70), ImGuiChildFlags_Borders);
+    {
+        ImGui::PushFont(fontSub);
+        ImGui::TextColored(COL_DIM, "SELECT CONTROLLER");
+        ImGui::PopFont();
+
+        if (g_device_count > 0) {
+            const char *items[MAX_CONTROLLERS] = {};
+            char labels[MAX_CONTROLLERS][96] = {};
+            for (int i = 0; i < g_device_count; i++) {
+                unsigned long long device_id = (unsigned long long)g_device_ids[i];
+                snprintf(labels[i], sizeof(labels[i]), "Controller %d (%016llX)", i + 1, device_id);
+                items[i] = labels[i];
+            }
+
+            int selected = g_selected_device_idx;
+            if (selected < 0 || selected >= g_device_count)
+                selected = 0;
+            ImGui::SetNextItemWidth(-1);
+            ImGui::BeginDisabled(g_worker_busy || g_device_count <= 1);
+            if (ImGui::Combo("##controller_select", &selected, items, g_device_count)) {
+                if (selected >= 0 && selected < g_device_count) {
+                    g_selected_device_idx = selected;
+                    g_selected_device_id = g_device_ids[selected];
+                    g_config_selected_device_id = g_selected_device_id;
+                    LoadSelectedProfile();
+                    SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray, g_selected_device_id);
+                    SetStatus("Controller selected", COL_DIM);
+                }
+            }
+            ImGui::EndDisabled();
+        } else {
+            ImGui::TextColored(COL_DIM, "No controllers discovered");
+        }
+    }
+    ImGui::EndChild();
+    ImGui::Spacing();
+
     ImGui::BeginChild("##bright_card", ImVec2(-1, 120), ImGuiChildFlags_Borders);
     {
         ImGui::PushFont(fontSub);
@@ -496,11 +745,11 @@ static void RenderGui(ImFont *fontTitle, ImFont *fontSub, ImFont *fontBig)
 
     if (ImGui::Checkbox("Start with Windows", &g_start_with_windows)) {
         SetAutoStart(g_start_with_windows);
-        SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray);
+        SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray, g_selected_device_id);
     }
     ImGui::SameLine(0, 20);
     if (ImGui::Checkbox("Minimize to tray", &g_minimize_to_tray)) {
-        SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray);
+        SaveConfig(g_brightness, g_mode_idx, g_start_with_windows, g_minimize_to_tray, g_selected_device_id);
     }
 
     ImGui::End();
@@ -573,7 +822,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     g_worker_thread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
 
     InitConfigPath();
-    LoadConfig(&g_brightness, &g_mode_idx, &g_start_with_windows, &g_minimize_to_tray);
+    LoadConfig(&g_brightness, &g_mode_idx, &g_start_with_windows, &g_minimize_to_tray, &g_config_selected_device_id);
+    g_default_brightness = g_brightness;
+    g_default_mode_idx = g_mode_idx;
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance,
         nullptr, nullptr, nullptr, nullptr, L"xbledctl", nullptr };
@@ -627,9 +878,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     if (!fontSub)     fontSub     = fontDefault;
     fontBig = fontTitle;
 
-    RefreshController();
-    if (g_controller_present)
-        ApplyLed();
+    TryAutoApply();
 
     g_start_with_windows = IsAutoStartEnabled();
 
@@ -654,20 +903,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
         if (g_device_removed) {
             g_device_removed = false;
-            if (g_controller_present) {
-                xbox_close(&g_ctrl);
-                g_controller_present = false;
-                SetStatus("Controller disconnected", COL_DIM);
-                g_device_change_pending = false;
-            }
+            g_device_change_pending = true;
+            g_device_change_tick = GetTickCount();
         }
 
-        if (g_device_change_pending && !g_controller_present
-            && (GetTickCount() - g_device_change_tick) >= 1000) {
+        if (g_device_change_pending
+            && (GetTickCount() - g_device_change_tick) >= 1000
+            && !g_worker_busy) {
             g_device_change_pending = false;
             TryAutoApply();
-        } else if (g_device_change_pending && g_controller_present) {
-            g_device_change_pending = false;
         }
 
         if (g_minimized_to_tray)

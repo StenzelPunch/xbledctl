@@ -40,7 +40,9 @@ typedef struct {
 } XboxController;
 
 void xbox_init(XboxController *ctrl);
+bool xbox_enumerate_devices(uint64_t *device_ids, int max_devices, int *out_count);
 bool xbox_open(XboxController *ctrl);
+bool xbox_open_device(XboxController *ctrl, uint64_t device_id);
 void xbox_close(XboxController *ctrl);
 void xbox_cleanup(XboxController *ctrl);
 bool xbox_set_led(XboxController *ctrl, uint8_t mode, uint8_t brightness);
